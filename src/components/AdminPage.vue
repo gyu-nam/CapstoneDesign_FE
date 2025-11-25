@@ -100,40 +100,61 @@ import { ref, onMounted, computed } from 'vue';
 import HeaderView from '@/components/HeaderView.vue';
 import GroupPW from '@/components/GroupPW.vue'; 
 
+
+// API URL 상수 정의
+const USER_INFO_URL = 'api/user/info';
+const ACCOUNT_CHECK_URL = '/user/account-check';
+const USER_LEAVE_URL = 'api/user/leave'; // POST
+
+// 상태 변수
 const isLoading = ref(true);
 const isWithdrawing = ref(false);
 const isModalOpen = ref(false);
+// 모달에 전달할 그룹 정보 객체 (ID, Hash 포함)
+const selectedGroupInfo = ref(null); 
 
-const selectedGroupInfo = ref(null);
 
+// 초기 데이터 구조 (API 응답 필드명을 따름)
 const userData = ref({
   email: '',
   created_at: '',
-  accounts: [],
+  // accounts는 '/user/account-check' 응답 리스트를 저장합니다.
+  accounts: [], 
 });
 
+/**
+ * Computed: accounts 배열에서 그룹 정보를 추출하여 중복 없는 그룹 목록을 생성합니다.
+ * 명세서 변경: accounts 응답에 groups.id, groups.name, groups.password_hash가 포함되었다고 가정합니다.
+ */
 const uniqueGroups = computed(() => {
   const groupsMap = new Map();
   
   userData.value.accounts.forEach(account => {
-    const groupId = account.group_id;
-    const groupName = account.group_name;
-    const ledgerName = account.ledger_name;
+    // API 응답에서 그룹 및 장부 정보 추출 (명세서 확장 필드 사용)
+    const groupId = account['groups.id'];
+    const groupName = account['groups.name'];
+    const groupHash = account['groups.password_hash'];
+    const ledgerName = account['ledgers.name'];
 
+    // 1. 그룹 정보 가공
     if (!groupsMap.has(groupId)) {
       groupsMap.set(groupId, {
         id: groupId,
         name: groupName,
-        ledgers: []
+        password_hash: groupHash,
+        ledgers: [] 
       });
     }
 
-    const g = groupsMap.get(groupId);
-
-    if (!g.ledgers.some(l => l.name === ledgerName)) {
-      g.ledgers.push({
-        id: `${groupId}-${ledgerName}`,
-        name: ledgerName
+    // 2. 장부 정보 가공
+    const existingGroup = groupsMap.get(groupId);
+    const ledgerId = account.id + ledgerName; // 장부 ID가 없으므로 임시 생성
+    
+    // 장부 중복 방지 (같은 그룹에 동일한 장부 이름이 여러 계좌에 연결될 수 있음)
+    if (!existingGroup.ledgers.some(l => l.name === ledgerName)) {
+      existingGroup.ledgers.push({ 
+        id: ledgerId, 
+        name: ledgerName 
       });
     }
   });
@@ -141,57 +162,171 @@ const uniqueGroups = computed(() => {
   return Array.from(groupsMap.values());
 });
 
+
+// --- 데이터 호출 메서드 ---
+
+/**
+ * API 연동: 사용자 정보 (email, created_at)를 서버에서 가져옵니다. (GET api/user/info)
+ */
+const fetchUserInfo = async () => {
+  try {
+    const response = await fetch(USER_INFO_URL, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        // TODO: 인증 토큰 (예: JWT)을 헤더에 포함해야 합니다.
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error('사용자 정보 로딩 실패.');
+    }
+
+    const data = await response.json();
+    userData.value.created_at = data['users.created_at']; 
+    userData.value.email = data['users.email']; 
+    
+  } catch (error) {
+    console.error('사용자 데이터 로딩 중 오류 발생:', error);
+  }
+};
+
+/**
+ * API 연동: 계좌 정보 및 장부 정보를 서버에서 가져옵니다. (GET /user/account-check)
+ */
+const fetchAccountAndLedgerInfo = async () => {
+  try {
+    const response = await fetch(ACCOUNT_CHECK_URL, {
+      method: 'GET',
+      headers: {
+        // TODO: 인증 토큰을 헤더에 포함해야 합니다.
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error('계좌/장부 정보 로딩 실패.');
+    }
+
+    const data = await response.json();
+    
+    // 명세서 확장 필드 포함 매핑:
+    userData.value.accounts = data.map(account => ({
+      id: account['accounts.id'], // 고유 키
+      bank_name: account.bank_name,
+      account_last4: account.account_last4,
+      holder_name: account.holder_name,
+      registered_at: account.registered_at, 
+      ledger_name: account['ledgers.name'], // 장부 이름
+      group_name: account['groups.name'], // 그룹 이름 (계좌표 표시용)
+      // NOTE: groups.id, groups.password_hash는 uniqueGroups 가공에 사용되지만,
+      // accounts 배열에도 원본 필드 그대로 남겨둡니다.
+    }));
+    
+  } catch (error) {
+    console.error('계좌/장부 정보 로딩 중 오류 발생:', error);
+  }
+};
+
+
+// --- UI/액션 메서드 ---
+
+/**
+ * ISO 형식의 타임스탬프를 보기 좋은 형식으로 변환합니다.
+ */
 const formatTimestamp = (timestamp) => {
   if (!timestamp) return '알 수 없음';
-  return new Date(timestamp).toLocaleString('ko-KR');
+  
+  try {
+    const date = new Date(timestamp);
+    return date.toLocaleString('ko-KR', {
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+    });
+  } catch (e) {
+    return timestamp; 
+  }
 };
 
+/**
+ * 그룹 비밀번호 재설정 모달을 띄우는 함수입니다.
+ * @param {object} group - 그룹 정보 객체 (ID 및 password_hash 포함)
+ */
 const resetGroupPassword = (group) => {
+  // 1번 방식: 상위 컴포넌트에서 조회한 그룹 정보를 모달에 전달
   selectedGroupInfo.value = group;
   isModalOpen.value = true;
+  console.log(`그룹 ID ${group.id}의 비밀번호 재설정 모달을 엽니다. Hash: ${group.password_hash}`);
 };
 
+/**
+ * 비밀번호 재설정 성공 후 호출되는 함수 (GroupPW.vue 모달에서 발생)
+ */
 const handlePasswordResetSuccess = () => {
-  isModalOpen.value = false;
-  alert('그룹 비밀번호가 성공적으로 재설정되었습니다.');
+    isModalOpen.value = false; // 모달 닫기
+    alert('그룹 비밀번호가 성공적으로 재설정되었습니다.');
+    // TODO: 필요하다면 데이터 새로고침 (loadAllData())
 };
 
+/**
+ * API 연동: 회원 탈퇴를 확인하고 서버에 요청하는 함수입니다. (POST api/user/leave)
+ */
 const confirmWithdrawal = async () => {
-  alert('하드코딩 상태에서는 탈퇴 요청이 전송되지 않습니다.');
+  const message = '정말로 탈퇴하십니까? 삭제된 데이터는 돌아오지 않습니다.';
+  
+  if (window.confirm(message)) {
+    isWithdrawing.value = true;
+    
+    try {
+      const response = await fetch(USER_LEAVE_URL, {
+        method: 'POST', 
+        headers: {
+          'Content-Type': 'application/json',
+          // TODO: 인증 토큰을 헤더에 포함해야 합니다.
+        },
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        alert(`회원 탈퇴가 성공적으로 처리되었습니다: ${data.message}.`);
+        
+        // TODO: 탈퇴 성공 후 로그인 페이지 또는 홈으로 리다이렉트
+        console.log("탈퇴 성공, 리다이렉트 필요.");
+        
+      } else {
+        const errorText = await response.text();
+        throw new Error(`탈퇴 처리 중 오류가 발생했습니다. (HTTP 상태: ${response.status}, 응답: ${errorText})`);
+      }
+    } catch (error) {
+      console.error('회원 탈퇴 처리 중 오류 발생:', error);
+      alert('회원 탈퇴에 실패했습니다: ' + error.message);
+    } finally {
+      isWithdrawing.value = false;
+    }
+  }
 };
 
-onMounted(() => {
-  // -----------------------
-  // 💾 하드코딩 데이터 주입
-  // -----------------------
-  userData.value = {
-    email: "test@example.com",
-    created_at: "2025-11-10T12:34:56Z",
-    accounts: [
-      {
-        id: 1,
-        bank_name: "KB국민은행",
-        account_last4: "1234",
-        holder_name: "김규남",
-        registered_at: "2025-11-11T10:20:30Z",
-        ledger_name: "2학기 장부",
-        group_name: "25학년도 학생회",
-        group_id: 10,
-      },
-      {
-        id: 2,
-        bank_name: "신한은행",
-        account_last4: "9876",
-        holder_name: "김규남",
-        registered_at: "2025-11-11T15:45:00Z",
-        ledger_name: "2학기 장부",
-        group_name: "동아리 A",
-        group_id: 20,
-      },
-    ]
-  };
 
-  isLoading.value = false;
+/**
+ * 모든 초기 데이터를 병렬로 로드하는 함수
+ */
+const loadAllData = async () => {
+  isLoading.value = true;
+  try {
+    await Promise.all([
+      fetchUserInfo(),
+      fetchAccountAndLedgerInfo()
+    ]);
+  } catch (error) {
+    console.error('데이터 로딩 중 치명적인 오류 발생:', error);
+  } finally {
+    isLoading.value = false;
+  }
+};
+
+
+// --- 생명주기 훅 ---
+onMounted(() => {
+  loadAllData();
 });
 </script>
 

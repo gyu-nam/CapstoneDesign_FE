@@ -2,8 +2,8 @@
   <HeaderView />
 
   <div class="intro-section">
-    <h1>Clean : US</h1>
-    <p>블록체인에 기록된 무결성이 보장된 장부를 확인하세요!</p>
+    <h1>Clean : US(URI Service)</h1>
+    <p>장부를 투명하게 조회할 수 있게 도와줍니다.</p>
     
     <div class="button-group">
       <button @click="scrollToContent" class="scroll-button">게시물 바로가기</button>
@@ -121,33 +121,6 @@
 </template>
 
 <script setup>
-const MOCK_POSTS = [
-  {
-    id: 1,
-    name: '25년도 1학기 컴퓨터공학과 학생회 장부',
-    groupName: '컴퓨터공학과 학생회',
-    date: '2025-03-02',
-  },
-  {
-    id: 2,
-    name: '25년도 1학기 총학생회 장부',
-    groupName: '총학생회',
-    date: '2025-03-05',
-  },
-  {
-    id: 3,
-    name: '25년도 2학기 동아리 A 장부',
-    groupName: '동아리 A',
-    date: '2025-09-10',
-  },
-  {
-    id: 4,
-    name: '25년도 2학기 동아리 B 장부',
-    groupName: '동아리 B',
-    date: '2025-07-20',
-  },
-  // 필요하면 더 추가해서 테스트해도 됨
-];
 
 import { useRouter } from 'vue-router';
 import { ref, computed, onMounted, nextTick, watch } from 'vue';
@@ -185,38 +158,31 @@ const accessError = ref('');
 const fetchPosts = async (page = currentPage.value) => {
   loading.value = true;
   errorMessage.value = '';
+  const endpoint = searchQuery.value 
+    ? `/ledgers/search?search=${searchQuery.value}&page=${page}&size=${pageSize}`
+    : `/ledgers?page=${page}&size=${pageSize}`;
 
-  try {
-    // 1) 기본 데이터: 하드코딩된 MOCK_POSTS에서 시작
-    let source = [...MOCK_POSTS];
-
-    // 2) 검색어가 있으면 필터링 (모임명 / 그룹명 둘 다 검색)
-    if (searchQuery.value && searchQuery.value.trim() !== '') {
-      const q = searchQuery.value.trim().toLowerCase();
-      source = source.filter((p) =>
-        (p.name && p.name.toLowerCase().includes(q)) ||
-        (p.groupName && p.groupName.toLowerCase().includes(q))
-      );
-    }
-
-    // 3) 전체 개수 / 페이지 계산
-    totalItems.value = source.length;
-    const startIndex = (page - 1) * pageSize;
-    const endIndex = startIndex + pageSize;
-    const pageItems = source.slice(startIndex, endIndex);
-
-    postsData.value = pageItems;
-    currentPage.value = page;
-
-    // 4) 데이터가 없을 때 메시지
-    if (source.length === 0) {
+ try {
+    const { data } = await api.get(endpoint); // ✅ api 사용
+    if (Array.isArray(data.groups) && data.groups.length > 0) {
+      postsData.value = data.groups.map(p => ({
+        id: p.id,
+        name: p.name || '(제목 없음)',
+        date: p.created_at ? p.created_at.slice(0, 10) : '날짜 없음',
+        groupName: p.group_name || '(그룹명 없음)',
+      }));
+      totalItems.value = data.totalItems ?? data.groups.length;
+      currentPage.value = page;
+    } else {
+      postsData.value = [];
+      totalItems.value = 0;
       errorMessage.value = '표시할 게시물이 없습니다.';
     }
   } catch (e) {
-    console.error('게시물 로드 실패(하드코딩 버전):', e);
+    console.error('게시물 로드 실패:', e);
     postsData.value = [];
     totalItems.value = 0;
-    errorMessage.value = '데이터를 불러오는 중 오류가 발생했습니다.';
+    errorMessage.value = e?.response?.data?.message || '서버 연결 오류가 발생했습니다.';
   } finally {
     loading.value = false;
   }
@@ -376,7 +342,6 @@ onMounted(async () => {
     gap: 15px; /* 버튼 간 간격 */
     margin-top: 30px;
 }
-
 .scroll-button,
 .ledger-button {
   padding: 12px 25px;
@@ -388,11 +353,11 @@ onMounted(async () => {
 }
 
 .scroll-button {
-  background-color: #2F80ED;
+  background-color: #007bff;
   color: white;
 }
 .scroll-button:hover {
-  background-color: #1A73E8;
+  background-color: #0056b3;
 }
 .ledger-button {
   background-color: #06c122ff;
@@ -453,16 +418,15 @@ onMounted(async () => {
   gap: 20px;
 }
 .post-card {
-  position: relative;
-  padding: 20px;
-  border-radius: 12px;
-  box-shadow: 0 4px 10px rgba(0,0,0,0.05);
-}
-
-.favorite-button {
-  position: absolute;
-  top: 10px;
-  right: 12px;
+  background-color: white;
+  border-radius: 8px;
+  padding: 15px;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  flex-direction: column;
+  transition: transform 0.2s, box-shadow 0.2s;
 }
 .post-card:hover {
   transform: translateY(-3px);

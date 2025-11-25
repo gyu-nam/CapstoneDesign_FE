@@ -16,12 +16,12 @@
           <span class="meta-value">{{ ledgerId }}</span>
         </p>
         <p class="meta-item">
-          <span class="meta-label">그룹:</span>
+          <span class="meta-label">모임:</span>
           <span class="meta-value">{{ postData.group }}</span>
         </p>
         <p class="meta-item">
           <span class="meta-label">작성일:</span>
-          <span class="meta-value">{{ formatDate(postData.date) }}</span>
+          <span class="meta-value">{{ postData.date }}</span>
         </p>
       </div>
     </header>
@@ -97,249 +97,230 @@
 <script setup>
 import { ref, defineProps, onMounted, computed } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
+import { api } from '@/api/axios'; 
+import { ethers } from "ethers";
+import { keccak256 } from "js-sha3";
 
-const router = useRouter();
-const route = useRoute();
 
-// 라우터/props로부터 ledgerId 받는 부분은 그대로 유지
+const router = useRouter(); 
+const route = useRoute(); 
+
 const props = defineProps({ id: [Number, String] });
-const ledgerId = computed(() => props.id || route.params.id || 1);
+const ledgerId = computed(() => props.id || route.params.id);
 
-// 상태값들
-const items = ref([]);
+const items = ref([]); 
 const loading = ref(false);
 const loadingVerification = ref(false);
 const error = ref(null);
 const verificationMessage = ref('');
 const isVerificationSuccess = ref(false);
 
-// 장부 메타데이터 (제목, 생성일 등)
-const ledgerMetadata = ref({});
+// 💡 장부 메타데이터 상태 (postData computed 속성에서 사용)
+const ledgerMetadata = ref({}); 
 
-// 화면 상단에 보이는 postData
+let provider = null;
+let contract = null;
+const RPC_URL = "https://rpc-amoy.polygon.technology/";
+const CONTRACT_ADDRESS = "0xYourActualMerkleContractAddressHere";
+const CONTRACT_ABI = [
+  "function merkleRoots(uint256) view returns (bytes32)",
+  "function recordMerkleRoot(bytes32) external"
+];
+
+
 const postData = computed(() => {
-  return {
-    id: ledgerId.value,
-    title: ledgerMetadata.value.name || '거래내역 상세 (하드코딩)',
-    group: '컴공 25학번 학생회',  // 하드코딩
-    date: ledgerMetadata.value.created_at || '2025-01-10',
-  };
+    return { 
+        id: ledgerId.value, 
+        title: ledgerMetadata.value.name || '거래내역 상세',
+        group: '정보 미정', // API에서 제공되지 않음
+        date: ledgerMetadata.value.created_at || '날짜 미정'
+    };
 });
 
-// Helper들
+const initContract = () => {
+    try {
+        provider = new ethers.JsonRpcProvider(RPC_URL); 
+        contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, provider);
+    } catch (e) {
+        console.error("Contract 초기화 실패:", e);
+        error.value = "블록체인 연결 초기화 실패. RPC URL을 확인하세요.";
+    }
+};
+
+// Merkle Proof 계산 함수
+const computeMerkleRoot = (leaf, proof) => {
+    if (!leaf || !proof || !Array.isArray(proof)) {
+      console.error("머클 계산 실패: leaf 또는 proof 데이터 오류");
+      return null;
+    }
+    
+    let hash = leaf.toLowerCase();
+    
+    for (const { node, position } of proof) {
+      const sibling = node.toLowerCase();
+      const h = hash.replace(/^0x/, "");
+      const s = sibling.replace(/^0x/, "");
+
+      if (position === "L") {
+        hash = "0x" + keccak256(s + h);
+      } 
+      else if (position === "R") {
+        hash = "0x" + keccak256(h + s);
+      } 
+      else {
+        console.error("proof position 값 오류:", position);
+        return null;
+      }
+    }
+    return hash;
+};
+
+
+// --- Helper Functions ---
 const formatAmount = (amount) => {
-  if (amount == null) return '—';
-  const sign = String(amount).includes('-') ? '-' : (String(amount).includes('+') ? '+' : '');
-  const number = Number(String(amount).replace('+', '').replace('-', ''));
-  return sign + number.toLocaleString('ko-KR');
+    if (amount == null) return '—';
+    const sign = String(amount).includes('-') ? '-' : (String(amount).includes('+') ? '+' : '');
+    const number = Number(String(amount).replace('+', '').replace('-', ''));
+    return sign + number.toLocaleString('ko-KR');
 };
 
-const formatDate = (d) => (d ? String(d).slice(0, 10) : '—');
-
+const formatDate = (d) => d ? String(d).slice(0, 10) : '—';
 const goBackToMain = () => router.push({ name: 'MainView' });
-
 const getAmountClass = (amount) => {
-  if (!amount) return '';
-  const amountStr = String(amount);
-  if (amountStr.includes('-')) return 'row-debit';
-  if (amountStr.includes('+')) return 'row-credit';
-  return '';
+    if (!amount) return '';
+    const amountStr = String(amount);
+    if (amountStr.includes('-')) return 'row-debit';
+    if (amountStr.includes('+')) return 'row-credit';
+    return '';
 };
 
-// 📌 하드코딩 거래내역 로드 함수
+// --- API Functions ---
+
 const fetchTransactions = async () => {
-  loading.value = true;
-  error.value = null;
+    loading.value = true;
+    error.value = null;
+    if (!ledgerId.value) { error.value = "장부 ID가 유효하지 않습니다."; loading.value = false; return; }
 
-  try {
-    // 장부 메타데이터 하드코딩
-    ledgerMetadata.value = {
-      name: '25학년도 2학기 장부',
-      created_at: '2025-11-10T12:34:56Z',
-    };
+    try {
+        const { data } = await api.get(`/api/ledgers/${ledgerId.value}/transactions`);
+        
+        // 🚨 API 응답 구조 가정: { transactions: [..], ledgers: { name: '...', created_at: '...' } }
+        const rawTxs = data.transactions || [];
+        // 💡 장부 메타데이터 업데이트
+        ledgerMetadata.value = data.ledgers || {}; 
 
-    // 거래 내역 하드코딩 (수입/지출 섞어서 예시)
-  items.value = [
-  {
-    id: 'TX-001',
-    providerTxId: 'PTX-001',
-    txAt: '2025-11-10T09:05:11Z',
-    shopName: '입금',
-    amount: '+500000',
-    createdAt: '2025-10-10T09:05:40Z',
-    blockNumber: 5348200,
-    integrity: true,
-    integrityMessage: '✅ 무결성 검증 성공',
-    status: 'ANCHORED',
-    batchId: 1,
-  },
-  {
-    id: 'TX-002',
-    providerTxId: 'PTX-002',
-    txAt: '2025-11-10T10:41:08Z',
-    shopName: '편의점',
-    amount: '-23000',
-    createdAt: '2025-01-10T10:41:50Z',
-    blockNumber: 5348305,
-    integrity: true,
-    integrityMessage: '✅ 무결성 검증 성공',
-    status: 'ANCHORED',
-    batchId: 1,
-  },
-  {
-    id: 'TX-003',
-    providerTxId: 'PTX-003',
-    txAt: '2025-11-10T14:12:32Z',
-    shopName: '식당',
-    amount: '-40000',
-    createdAt: '2025-01-10T14:13:02Z',
-    blockNumber: 5348458,
-    integrity: undefined,
-    integrityMessage: '',
-    status: 'ANCHORED',
-    batchId: 1,
-  },
-  {
-    id: 'TX-004',
-    providerTxId: 'PTX-004',
-    txAt: '2025-11-11T09:15:20Z',
-    shopName: '상점',
-    amount: '-45000',
-    createdAt: '2025-01-11T09:16:00Z',
-    blockNumber: 5349381,
-    integrity: true,
-    integrityMessage: '✅ 무결성 검증 성공',
-    status: 'ANCHORED',
-    batchId: 1,
-  },
-  {
-    id: 'TX-005',
-    providerTxId: 'PTX-005',
-    txAt: '2025-11-11T13:40:10Z',
-    shopName: '입금',
-    amount: '+100000',
-    createdAt: '2025-11-11T13:41:00Z',
-    blockNumber: 5349550,
-    integrity: undefined,
-    integrityMessage: '',
-    status: 'ANCHORED',
-    batchId: 1,
-  },
-  {
-    id: 'TX-006',
-    providerTxId: 'PTX-006',
-    txAt: '2025-11-11T17:22:48Z',
-    shopName: '상점',
-    amount: '-75000',
-    createdAt: '2025-11-11T17:23:30Z',
-    blockNumber: 5349822,
-    integrity: undefined,
-    integrityMessage: '',
-    status: 'ANCHORED',
-    batchId: 2,
-  },
-  {
-    id: 'TX-007',
-    providerTxId: 'PTX-007',
-    txAt: '2025-11-12T08:15:09Z',
-    shopName: '입금',
-    amount: '+150000',
-    createdAt: '2025-11-12T08:15:45Z',
-    blockNumber: 5350310,
-    integrity: true,
-    integrityMessage: '✅ 무결성 검증 성공',
-    status: 'ANCHORED',
-    batchId: 2,
-  },
-  {
-    id: 'TX-008',
-    providerTxId: 'PTX-008',
-    txAt: '2025-11-12T11:21:55Z',
-    shopName: '상점',
-    amount: '-32000',
-    createdAt: '2025-11-12T11:22:15Z',
-    blockNumber: 5350450,
-    integrity: undefined,
-    integrityMessage: '',
-    status: 'ANCHORED',
-    batchId: 2,
-  },
-  {
-    id: 'TX-009',
-    providerTxId: 'PTX-009',
-    txAt: '2025-11-12T14:40:28Z',
-    shopName: '식당',
-    amount: '-50000',
-    createdAt: '2025-11-12T14:41:10Z',
-    blockNumber: null,
-    integrity: undefined,
-    integrityMessage: '',
-    status: 'PENDING',
-    batchId: 0,
-  },
-  {
-    id: 'TX-010',
-    providerTxId: 'PTX-010',
-    txAt: '2025-11-12T15:55:12Z',
-    shopName: '입금',
-    amount: '+30000',
-    createdAt: '2025-11-12T15:55:56Z',
-    blockNumber: null,
-    integrity: undefined,
-    integrityMessage: '',
-    status: 'PENDING',
-    batchId: 0,
-  },
-];
-  } catch (e) {
-    console.error('하드코딩 거래 내역 로드 실패(?)', e);
-    items.value = [];
-    error.value = '거래 내역을 불러오지 못했습니다. (하드코딩)';
-  } finally {
-    loading.value = false;
-  }
+        if (rawTxs.length > 0) {
+            items.value = rawTxs.map((tx) => ({
+                id: tx.transaction_id || tx.provider_tx_id || tx.tx_hash,
+                
+                providerTxId: tx.provider_tx_id, 
+                txAt: tx.tx_at, 
+                shopName: tx.shop_name, 
+                amount: String(tx.amount),
+                createdAt: tx.create_at,
+                
+                blockNumber: tx.anchors ? tx.anchors.block_number : '—',
+                
+                integrity: undefined,
+                integrityMessage: '',
+                status: tx.anchors ? 'ANCHORED' : 'PENDING',
+                batchId: tx.anchors ? tx.anchors.batch_id : 0, 
+            }));
+        } else {
+            items.value = [];
+            error.value = '거래 내역을 불러오지 못했습니다.';
+        }
+    } catch (e) {
+        console.error('거래 내역 로드 실패:', e);
+        items.value = [];
+        error.value = e?.response?.data?.message || '거래 내역 로드 중 서버 오류가 발생했습니다.';
+    } finally {
+        loading.value = false;
+    }
 };
 
-// 📌 동기화 버튼: 그냥 다시 하드코딩 데이터 로드
 const syncData = async () => {
-  alert('하드코딩 모드: 백엔드 동기화 대신 더미 데이터를 다시 로드합니다.');
-  fetchTransactions();
+    alert('백엔드 데이터 동기화 요청 (가정). 거래 내역을 새로고침합니다.');
+    fetchTransactions();
 };
 
-// 📌 무결성 검증 버튼: 실제론 블록체인 안 타고, 프론트에서 상태만 바꿔줌
-const verifyMerkleProof = async (tx) => {
-  if (!tx.id) {
-    alert('거래 ID를 찾을 수 없어 검증할 수 없습니다. (하드코딩)');
-    return;
-  }
+const verifyMerkleProof = async tx => {
+    if (!tx.id) { alert("거래 ID를 찾을 수 없어 검증할 수 없습니다."); return; }
+    if (!tx.batchId) { alert("블록체인 기록 대기 중이거나 Batch ID가 없습니다."); return; }
 
-  loadingVerification.value = true;
-  tx.integrity = undefined;
-  tx.integrityMessage = '검증 중... (하드코딩)';
+    if (!contract) initContract();
+    if (!contract) { alert(error.value || "컨트랙트 초기화에 실패했습니다."); return; }
 
-  // 살짝 딜레이 주고 싶으면 setTimeout 써도 되지만, 여기서는 바로 처리
-  try {
-    // 여기서는 항상 성공했다고 가정
-    tx.integrity = true;
-    tx.integrityMessage = '✅ 무결성 검증 성공 (하드코딩 - 실제 블록체인 미연결)';
-  } catch (e) {
-    console.error('무결성 검증 오류(하드코딩):', e);
-    tx.integrity = false;
-    tx.integrityMessage = '❌ 무결성 검증 실패 (하드코딩 에러)';
-  } finally {
-    loadingVerification.value = false;
-    // 반응성 유지를 위해 배열 업데이트
-    items.value = items.value.map((item) => (item.id === tx.id ? { ...tx } : item));
-  }
+    loadingVerification.value = true;
+    tx.integrity = undefined;
+    tx.integrityMessage = '검증 중...';
+
+    let proofResponseData;
+    try {
+        // 1. 💡 명세서 반영: URL 경로와 Path Parameter 사용 + Query Parameter 사용
+        // URL: /api/transactions/proof/{provider_tx_id}
+        // Query: ?ledgerId=...
+        const proofUrl = `/api/transactions/proof/${tx.providerTxId}`; 
+        
+        const { data } = await api.get(proofUrl, {
+            params: {
+                ledgerId: ledgerId.value // Query Parameter로 전송
+            }
+        }); 
+        proofResponseData = data;
+        
+        // 🚨 Merkle Proof 검증에 필요한 proof 배열 필드가 명세서 응답에 누락되어 있음.
+        // 클라이언트 검증을 위해 'proof' 필드가 있다고 가정하고 코드를 유지합니다.
+        if (!proofResponseData.leaf || !proofResponseData.proof || proofResponseData.batchId === undefined) {
+         throw new Error("백엔드로부터 올바른 Merkle Proof 데이터를 받지 못했습니다. (Leaf, Proof, Batch ID 필요)");
+       }
+    } catch (e) {
+        console.error('Proof 데이터 로드 실패:', e);
+        tx.integrity = false;
+        tx.integrityMessage = `❌ 무결성 검증 데이터 로드 실패: ${e.message || e?.response?.data?.message || '네트워크 오류'}`;
+        items.value = items.value.map((it) => (it.id === tx.id ? { ...tx } : it));
+        loadingVerification.value = false;
+        return;
+    }
+
+    try {
+        // 🚨 proof 필드는 명세서에 없지만, 클라이언트 검증을 위해 사용합니다.
+        const { leaf, proof, batchId } = proofResponseData;
+
+        // 1. 온체인 Merkle Root 조회
+        const scMerkleRootBytes = await contract.merkleRoots(batchId);
+        const scMerkleRoot = String(scMerkleRootBytes).toLowerCase();
+
+        // 2. 프론트에서 Merkle Proof 를 통해 root 계산
+        const computedRoot = computeMerkleRoot(leaf, proof).toLowerCase();
+
+        // 3. 무결성 검증
+        if (computedRoot === scMerkleRoot) {
+            tx.integrity = true;
+            tx.integrityMessage = "✅ 무결성 검증 성공 (Merkle Proof 일치)";
+        } else {
+            tx.integrity = false;
+            tx.integrityMessage = "❌ 무결성 검증 실패 (Proof 불일치)";
+            console.warn(`Computed Root: ${computedRoot}, SC Root: ${scMerkleRoot}`);
+        }
+
+    } catch (e) {
+        console.error("SC 호출 및 검증 오류:", e);
+        tx.integrity = false;
+        tx.integrityMessage = `❌ 블록체인 검증 오류: 컨트랙트 호출 또는 Merkle 계산 오류.`;
+    } finally {
+        loadingVerification.value = false;
+        items.value = items.value.map(item => item.id === tx.id ? {...tx} : item);
+    }
 };
 
-// 마운트 시 하드코딩 데이터 로드
 onMounted(() => {
-  if (!ledgerId.value) {
-    error.value = '❌ 장부 ID가 유효하지 않습니다. (하드코딩 모드)';
-    return;
-  }
-  fetchTransactions();
+    if (ledgerId.value) {
+        fetchTransactions();
+        initContract();
+    } else {
+        error.value = "❌ 장부 ID가 유효하지 않습니다.";
+    }
 });
 </script>
 
